@@ -1,81 +1,99 @@
-# token-budget-py
+# llm-token-split
 
-[![PyPI](https://img.shields.io/pypi/v/token-budget-py.svg)](https://pypi.org/project/token-budget-py/)
-[![Python](https://img.shields.io/pypi/pyversions/token-budget-py.svg)](https://pypi.org/project/token-budget-py/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
-**Thread-safe shared token + USD budget for concurrent LLM tasks.**
+**Split long documents into overlapping chunks that each fit within an LLM context window.**
 
-Fan-out workloads — agents, parallel summarizers, batch evals — race many
-tasks to consume from one shared budget. This library is a small,
-zero-dependency counter with two axes (tokens, USD) that returns
-`BudgetExceeded` when a record would push past a configured cap.
+For RAG pipelines, summarization, and agent workflows that need to feed a long
+document to a model with a bounded context. Chunks overlap so consecutive pieces
+share context, which helps retrieval stitch results back together cleanly.
 
-Sibling to the Rust crate
-[`token-budget-pool`](https://crates.io/crates/token-budget-pool).
+Zero runtime dependencies.
 
 ## Install
 
 ```bash
-pip install token-budget-py
+pip install llm-token-split
 ```
 
 ## Use
 
 ```python
-from token_budget import BudgetPool, BudgetExceeded
+from llm_token_split import TokenSplitter
 
-pool = BudgetPool(token_cap=1_000_000, usd_cap=10.0)
+splitter = TokenSplitter(chunk_size=2000, overlap=200)
 
-try:
-    pool.record(tokens=1200, usd=0.0036)
-except BudgetExceeded as e:
-    # tell this worker to skip
-    print(f"out of budget: {e}")
+chunks = splitter.split(long_document)
+for chunk in chunks:
+    summary = call_llm(chunk)  # each chunk fits the context window
 ```
 
-Two-phase commit (reserve before the LLM call, commit the actual usage):
+By default token counts use a `len(text) // 4` chars-per-token heuristic. Pass
+your own tokenizer (anything that takes a string and returns an `int` count) for
+exact budgeting:
 
 ```python
-with pool.reserve(tokens=2000, usd=0.012) as r:
-    result = call_llm(prompt)
-    r.commit(tokens=result.usage.total_tokens, usd=result.cost_usd)
+import tiktoken
+
+enc = tiktoken.encoding_for_model("gpt-4o")
+splitter = TokenSplitter(
+    chunk_size=8000,
+    overlap=400,
+    tokenizer=lambda text: len(enc.encode(text)),
+)
 ```
 
-If the `with` block exits without `r.commit()` (e.g. the LLM call raised),
-the reservation is auto-released — no orphaned slots.
+`overlap` must be less than `chunk_size`; otherwise the constructor raises
+`ValueError`.
 
-Either axis is optional:
+### Position metadata
+
+`split_with_meta` returns `Chunk` objects that carry each chunk's offsets in the
+original text, its index, and the total chunk count. The offsets bracket the
+source text exactly (`text[chunk.start_char:chunk.end_char] == chunk.text`),
+even when the document contains repeated content.
 
 ```python
-only_tokens = BudgetPool(token_cap=500_000)        # USD unbounded
-only_usd    = BudgetPool(usd_cap=5.0)              # tokens unbounded
-unbounded   = BudgetPool()                         # both unbounded (counter only)
+for chunk in splitter.split_with_meta(long_document):
+    print(chunk.index, chunk.total, chunk.start_char, chunk.end_char)
 ```
 
-Atomic read of current state:
+### Check before splitting
 
 ```python
-snap = pool.snapshot()
-snap.tokens_used         # 1200
-snap.usd_remaining       # 9.9964
-snap.tokens_remaining    # 998800 (cap - used - reserved)
+if splitter.fits(text):
+    result = call_llm(text)        # no need to split
+else:
+    results = [call_llm(c) for c in splitter.split(text)]
 ```
 
-## What it does NOT do
+### Chat messages
 
-- No async runtime lock-in. Works under `asyncio`, `trio`, threads, sync.
-  The internal lock is a plain `threading.Lock` (held only for the
-  microseconds of a counter update).
-- No HTTP. Doesn't talk to any LLM provider.
-- No cost calculation. Wrap a cost calculator that returns USD per call
-  and feed the result into `record`. (See `claude-cost`, `openai-cost`,
-  `gemini-cost`, `bedrock-cost` on crates.io for Rust cost calculators
-  with the same authorship.)
-- No persistence. Counts live in process. For multi-process / multi-host
-  budgets, wrap a Redis or DB increment instead.
-- No automatic rollover. Call `pool.reset()` from your own cron / time
-  loop if you want a periodic window.
+`split_messages` splits the content of the *last* user message into chunks and
+returns one message-list variant per chunk. The input is never mutated; system
+and assistant messages (and earlier user turns) are preserved in every variant.
+
+```python
+messages = [
+    {"role": "system", "content": "You are a careful summarizer."},
+    {"role": "user", "content": very_long_text},
+]
+
+for variant in splitter.split_messages(messages):
+    response = call_llm(variant)
+```
+
+If there is no user message, or the last user message already fits, the original
+list is returned unchanged as the single variant.
+
+## How it works
+
+- Boundaries are found by binary search over character offsets, so any tokenizer
+  works (no assumption that tokens map 1:1 to characters or words).
+- Every returned chunk has a token count `<= chunk_size`.
+- Consecutive chunks share approximately `overlap` tokens of content.
+- An empty string returns `[""]`; text that already fits returns `[text]`.
 
 ## License
 

@@ -13,9 +13,9 @@ class Chunk:
 
     text: str
     start_char: int  # inclusive char offset in original text
-    end_char: int    # exclusive char offset in original text
-    index: int       # 0-based chunk index
-    total: int       # total number of chunks
+    end_char: int  # exclusive char offset in original text
+    index: int  # 0-based chunk index
+    total: int  # total number of chunks
 
 
 class TokenSplitter:
@@ -41,13 +41,11 @@ class TokenSplitter:
         tokenizer: Callable[[str], int] | None = None,
     ) -> None:
         if overlap >= chunk_size:
-            raise ValueError(
-                f"overlap ({overlap}) must be less than chunk_size ({chunk_size})"
-            )
+            raise ValueError(f"overlap ({overlap}) must be less than chunk_size ({chunk_size})")
         self._chunk_size = chunk_size
         self._overlap = overlap
-        self._tokenizer: Callable[[str], int] = tokenizer if tokenizer is not None else (
-            lambda text: len(text) // 4
+        self._tokenizer: Callable[[str], int] = (
+            tokenizer if tokenizer is not None else (lambda text: len(text) // 4)
         )
 
     @property
@@ -124,25 +122,25 @@ class TokenSplitter:
         """Return True if the text fits within a single chunk (token count <= chunk_size)."""
         return self._token_count(text) <= self._chunk_size
 
-    def split(self, text: str) -> list[str]:
-        """Split text into a list of overlapping chunk strings.
+    def _split_spans(self, text: str) -> list[tuple[int, int]]:
+        """Compute the (start_char, end_char) span of every chunk.
 
-        - Empty string returns ``[""]``.
-        - If text fits in one chunk, returns ``[text]``.
-        - All chunks have token count <= chunk_size.
-        - Consecutive chunks share approximately ``overlap`` tokens of content.
+        This is the single source of truth for chunk boundaries; both
+        :meth:`split` and :meth:`split_with_meta` derive from it so the
+        returned text and its reported offsets can never disagree (which
+        matters when the document contains repeated content).
         """
         if not text:
-            return [""]
+            return [(0, 0)]
         if self.fits(text):
-            return [text]
+            return [(0, len(text))]
 
-        chunks: list[str] = []
+        spans: list[tuple[int, int]] = []
         start = 0
 
         while start < len(text):
             end = self._find_chunk_end(text, start, self._chunk_size)
-            chunks.append(text[start:end])
+            spans.append((start, end))
 
             if end == len(text):
                 break
@@ -158,12 +156,22 @@ class TokenSplitter:
 
             # If remaining text from next_start fits, take it and stop
             if self.fits(text[next_start:]):
-                chunks.append(text[next_start:])
+                spans.append((next_start, len(text)))
                 break
 
             start = next_start
 
-        return chunks
+        return spans
+
+    def split(self, text: str) -> list[str]:
+        """Split text into a list of overlapping chunk strings.
+
+        - Empty string returns ``[""]``.
+        - If text fits in one chunk, returns ``[text]``.
+        - All chunks have token count <= chunk_size.
+        - Consecutive chunks share approximately ``overlap`` tokens of content.
+        """
+        return [text[start:end] for start, end in self._split_spans(text)]
 
     def split_with_meta(self, text: str) -> list[Chunk]:
         """Split text and return Chunk objects with position metadata.
@@ -175,31 +183,18 @@ class TokenSplitter:
         - ``index``: 0-based chunk index
         - ``total``: total number of chunks
         """
-        raw_chunks = self.split(text)
-        total = len(raw_chunks)
-        result: list[Chunk] = []
-
-        search_from = 0
-        for idx, chunk_text in enumerate(raw_chunks):
-            # Find the chunk text in the original string starting from search_from
-            start_char = text.find(chunk_text, search_from)
-            if start_char == -1:
-                # Fallback in case of edge cases
-                start_char = text.find(chunk_text)
-            end_char = start_char + len(chunk_text)
-            result.append(
-                Chunk(
-                    text=chunk_text,
-                    start_char=start_char,
-                    end_char=end_char,
-                    index=idx,
-                    total=total,
-                )
+        spans = self._split_spans(text)
+        total = len(spans)
+        return [
+            Chunk(
+                text=text[start_char:end_char],
+                start_char=start_char,
+                end_char=end_char,
+                index=idx,
+                total=total,
             )
-            # Next search must start after the current chunk's start (chunks can overlap)
-            search_from = start_char + 1
-
-        return result
+            for idx, (start_char, end_char) in enumerate(spans)
+        ]
 
     def split_messages(self, messages: list[dict]) -> list[list[dict]]:
         """Split the content of the last user message into chunks.

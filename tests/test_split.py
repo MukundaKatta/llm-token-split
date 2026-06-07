@@ -10,6 +10,7 @@ from llm_token_split import Chunk, TokenSplitter
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def word_tokenizer(text: str) -> int:
     """Toy tokenizer: one token per whitespace-separated word (or 1 if empty)."""
     return len(text.split()) if text.strip() else 0
@@ -276,3 +277,29 @@ def test_split_with_meta_total_matches_split_length():
     meta = s.split_with_meta(text)
     assert all(c.total == len(raw) for c in meta)
     assert len(meta) == len(raw)
+
+
+def test_split_with_meta_offsets_correct_with_repeated_content():
+    """Offsets must map to the true chunk positions even when content repeats.
+
+    Regression: with identical characters the old implementation re-located
+    chunks via ``str.find`` advancing one char at a time, which collapsed the
+    reported offsets to 0,1,2,... instead of the real chunk boundaries.
+    """
+    s = TokenSplitter(chunk_size=10, overlap=4, tokenizer=char_tokenizer)
+    text = "a" * 40
+    meta = s.split_with_meta(text)
+    raw = s.split(text)
+    assert len(meta) == len(raw)
+    for c, chunk_text in zip(meta, raw, strict=True):
+        # Offsets bracket the original text exactly...
+        assert text[c.start_char : c.end_char] == c.text
+        # ...and agree with what split() returned for that index.
+        assert c.text == chunk_text
+    # Consecutive chunks must advance (no two chunks share a start offset).
+    starts = [c.start_char for c in meta]
+    assert starts == sorted(starts)
+    assert len(set(starts)) == len(starts)
+    # First chunk anchored at 0, last chunk reaches the end of the text.
+    assert meta[0].start_char == 0
+    assert meta[-1].end_char == len(text)
